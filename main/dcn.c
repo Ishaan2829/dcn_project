@@ -22,6 +22,8 @@
 #include "mbedtls/md.h"
 #include "mbedtls/base64.h"
 #include "mqtt_client.h"
+#include "esp_crc.h"
+#include "miniz.h" 
 
 #define TAG "MQTT_CHAT"
 
@@ -29,8 +31,8 @@
 #define MQTT_PORT 1883
 
 #define AP_SSID "ESP32_Setup"
-#define AP_PASS "esp32pass"
-#define CAPTIVE_PASS "secret123"
+#define AP_PASS ""
+#define CAPTIVE_PASS "123456789"
 #define NVS_NAMESPACE "wifi_creds"
 #define STATUS_INTERVAL 30000
 #define DNS_PORT 53
@@ -42,6 +44,57 @@
 #define AES_IV_SIZE 12
 #define AES_TAG_SIZE 16
 #define DH_KEY_SIZE 256
+
+#define MAX_COMPRESSED_SIZE 1024
+#define BINARY_MAGIC 0xDEADBEEF
+#define PROTOCOL_VERSION 1
+
+#define MSG_TYPE_CHAT 0x01
+#define MSG_TYPE_STATUS 0x02  
+#define MSG_TYPE_KEY_EXCHANGE 0x03
+#define MSG_TYPE_HEARTBEAT 0x04
+
+
+#define MAX_CLIENTS 10
+#define MAC_RANDOMIZATION_INTERVAL 300000 
+#define ENABLE_MAC_RANDOMIZATION true
+#define ENABLE_IP_ROTATION true
+#define ENABLE_TRAFFIC_OBFUSCATION true
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;           // Magic number for validation
+    uint8_t version;          // Protocol version
+    uint8_t msg_type;         // Message type
+    uint16_t device_id_len;   // Device ID length
+    uint16_t payload_len;     // Payload length (compressed)
+    uint16_t original_len;    // Original payload length (before compression)
+    uint32_t crc32;          // CRC32 checksum
+    uint8_t compressed;       // 1 if payload is compressed, 0 if not
+    // Followed by: device_id + compressed_payload
+} binary_header_t;
+
+typedef struct {
+    uint8_t real_mac[6];
+    uint8_t virtual_mac[6];
+    uint32_t real_ip;
+    uint32_t virtual_ip;
+    uint64_t last_activity;
+    bool is_active;
+    char client_id[32];
+} client_privacy_t;
+
+typedef struct {
+    uint32_t destination_ip;
+    uint32_t gateway_ip;
+    uint8_t next_hop_mac[6];
+    uint32_t metric;
+    uint64_t timestamp;
+    bool is_active;
+} routing_entry_t;
+
+static client_privacy_t client_privacy_table[MAX_CLIENTS];
+static routing_entry_t routing_table[50];
+static char virtualDeviceID[20]; 
 
 static bool wifi_connected = false;
 static bool logged_in = false;
@@ -115,6 +168,42 @@ static char *base64Encode(const uint8_t* data, size_t len) {
   buf[olen] = '\0';
   return (char*)buf;
 }
+
+
+
+static void generateRandomMAC(uint8_t* mac) {
+    esp_fill_random(mac, 6);
+    mac[0] = (mac[0] & 0xFE) | 0x02; // Set locally administered bit
+}
+
+static void registerNewClient(uint32_t real_ip, uint8_t* real_mac, const char* client_id) {
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!client_privacy_table[i].is_active) {
+            client_privacy_table[i].real_ip = real_ip;
+            memcpy(client_privacy_table[i].real_mac, real_mac, 6);
+            client_privacy_table[i].virtual_ip = (192 << 24) | (168 << 16) | (100 << 8) | (10 + i);
+            generateRandomMAC(client_privacy_table[i].virtual_mac);
+            client_privacy_table[i].last_activity = esp_timer_get_time() / 1000;
+            client_privacy_table[i].is_active = true;
+            strncpy(client_privacy_table[i].client_id, client_id, sizeof(client_privacy_table[i].client_id) - 1);
+            ESP_LOGI(TAG, "[Privacy] Registered client %s with virtual identity", client_id);
+            break;
+        }
+    }
+}
+
+static void obfuscateTraffic(void) {
+    if (mqtt_connected) {
+        uint8_t dummy_data[32];
+        esp_fill_random(dummy_data, sizeof(dummy_data));
+        char dummy_topic[32];
+        snprintf(dummy_topic, sizeof(dummy_topic), "noise/channel%lu", esp_random() % 10UL);
+        esp_mqtt_client_publish(mqtt_client, dummy_topic, (char*)dummy_data, sizeof(dummy_data), 0, false);
+    }
+}
+
+
+
 
 static int base64Decode(const char* encoded, unsigned char** out_buf, size_t* out_len) {
   *out_len = 0;
@@ -575,17 +664,42 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         ESP_LOGI(TAG, "[WiFi Event] AP Started - SSID: %s", AP_SSID);
         break;
 
-      case WIFI_EVENT_AP_STACONNECTED:
+     /* case WIFI_EVENT_AP_STACONNECTED:
         ESP_LOGI(TAG, "[WiFi Event] Client connected to AP");
-        break;
+        break;*/
 
+      case WIFI_EVENT_AP_STACONNECTED:
+      {
+        ESP_LOGI(TAG, "[WiFi Event] Client connected to AP");
+        wifi_event_ap_staconnected_t* event_sta = (wifi_event_ap_staconnected_t*) event_data;
+        char client_id[32];
+        snprintf(client_id, sizeof(client_id), "Client_%02X%02X%02X", 
+                 event_sta->mac[3], event_sta->mac[4], event_sta->mac[5]);
+        registerNewClient(0, event_sta->mac, client_id);
+      }
+    break;
+    
       case WIFI_EVENT_AP_STADISCONNECTED:
+      {
         ESP_LOGI(TAG, "[WiFi Event] Client disconnected from AP");
-        break;
+        wifi_event_ap_stadisconnected_t* event_sta = (wifi_event_ap_stadisconnected_t*) event_data;
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (client_privacy_table[i].is_active && 
+                memcmp(client_privacy_table[i].real_mac, event_sta->mac, 6) == 0) {
+                client_privacy_table[i].is_active = false;
+                break;
+            }
+        }
+      }
+    break;
+
+      /*case WIFI_EVENT_AP_STADISCONNECTED:
+        ESP_LOGI(TAG, "[WiFi Event] Client disconnected from AP");
+        break;*/
 
       default:
         break;
-    }
+      }
   } else if (event_base == IP_EVENT) {
     if (event_id == IP_EVENT_STA_GOT_IP) {
       ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
@@ -713,7 +827,8 @@ static esp_err_t handle_root(httpd_req_t *req) {
              "<input type='text' name='ssid' placeholder='WiFi Network Name (SSID)' required>"
              "<input type='password' name='pass' placeholder='WiFi Password'>"
              "<input type='submit' value='Connect to WiFi'></form>"
-             "<p><small>Device will restart after saving credentials.</small></p></div></body></html>", deviceID);
+             "<p><small>Device will restart after saving credentials.</small></p>"
+             "<p><a href='/privacy'>View Privacy Status</a></p></div></body></html>", deviceID);
   }
 
   httpd_resp_send(req, page_buf, strlen(page_buf));
@@ -822,6 +937,38 @@ strncpy(pass, pass_start, sizeof(pass) - 1);
   return ESP_OK;
 }
 
+static esp_err_t handle_privacy_status(httpd_req_t *req) {
+    if (!logged_in) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Access Denied");
+        return ESP_FAIL;
+    }
+    
+    char response[2048];
+    snprintf(response, sizeof(response),
+        "<!DOCTYPE html><html><head><title>Privacy Status</title></head><body>"
+        "<h2>Privacy & Routing Status</h2>"
+        "<p><strong>Virtual Device ID:</strong> %s</p>"
+        "<p><strong>Active Clients:</strong></p><ul>", virtualDeviceID);
+    
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (client_privacy_table[i].is_active) {
+            char temp[200];
+            snprintf(temp, sizeof(temp), "<li>%s - Virtual IP: %d.%d.%d.%d</li>", 
+                     client_privacy_table[i].client_id,
+                     (int)(client_privacy_table[i].virtual_ip >> 24),
+                     (int)((client_privacy_table[i].virtual_ip >> 16) & 0xFF),
+                     (int)((client_privacy_table[i].virtual_ip >> 8) & 0xFF),
+                     (int)(client_privacy_table[i].virtual_ip & 0xFF));
+            strcat(response, temp);
+        }
+    }
+    
+    strcat(response, "</ul><a href='/'>Back</a></body></html>");
+    httpd_resp_send(req, response, strlen(response));
+    return ESP_OK;
+}
+
+
 static esp_err_t handle_not_found(httpd_req_t *req, httpd_err_code_t err) {
   ESP_LOGI(TAG, "[Web] Redirecting to captive portal");
   httpd_resp_set_status(req, "302 Found");
@@ -886,6 +1033,13 @@ static void startCaptivePortal() {
     httpd_register_uri_handler(web_server, &set_wifi);
 
     httpd_register_err_handler(web_server, HTTPD_404_NOT_FOUND, handle_not_found);
+
+    httpd_uri_t privacy_status = {
+    .uri = "/privacy",
+    .method = HTTP_GET,
+    .handler = handle_privacy_status
+    };
+httpd_register_uri_handler(web_server, &privacy_status);
   }
 
   captive_mode = true;
@@ -1136,6 +1290,30 @@ static void statusTask(void* param) {
   }
 }
 
+static void privacyTask(void* param) {
+    while (1) {
+        // Rotate virtual device ID every 5 minutes
+        static uint64_t last_rotation = 0;
+        uint64_t current_time = esp_timer_get_time() / 1000;
+        
+        if ((current_time - last_rotation) > MAC_RANDOMIZATION_INTERVAL) {
+            uint8_t new_mac[6];
+            generateRandomMAC(new_mac);
+            snprintf(virtualDeviceID, sizeof(virtualDeviceID), "ESP32-%02X%02X%02X%02X%02X%02X", 
+                     new_mac[0], new_mac[1], new_mac[2], new_mac[3], new_mac[4], new_mac[5]);
+            ESP_LOGI(TAG, "[Privacy] Rotated virtual device ID: %s", virtualDeviceID);
+            last_rotation = current_time;
+        }
+        
+        // Generate obfuscation traffic
+        obfuscateTraffic();
+        
+        vTaskDelay(30000 / portTICK_PERIOD_MS);
+    }
+}
+
+
+
 static void management_task(void* param) {
   while (1) {
     if (!captive_mode && !wifi_connected && wifiReconnectTime > 0 && esp_timer_get_time() / 1000 > wifiReconnectTime) {
@@ -1157,11 +1335,19 @@ void app_main(void) {
 
   initCrypto();
 
+  snprintf(deviceID, sizeof(deviceID), "ESP32-%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  generateRandomMAC(mac);
+  snprintf(virtualDeviceID, sizeof(virtualDeviceID), "ESP32-%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  ESP_LOGI(TAG, "[Setup] Real Device ID: %s, Virtual ID: %s", deviceID, virtualDeviceID);
+
   esp_err_t ret = nvs_flash_init();
   if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
     nvs_flash_erase();
     nvs_flash_init();
   }
+
+  xTaskCreate(privacyTask, "privacyTask", 4096, NULL, 1, NULL);
+
 
   esp_netif_init();
   esp_event_loop_create_default();

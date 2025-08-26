@@ -196,9 +196,7 @@ static void obfuscateTraffic(void) {
     if (mqtt_connected) {
         uint8_t dummy_data[32];
         esp_fill_random(dummy_data, sizeof(dummy_data));
-        char dummy_topic[32];
-        snprintf(dummy_topic, sizeof(dummy_topic), "noise/channel%lu", esp_random() % 10UL);
-        esp_mqtt_client_publish(mqtt_client, dummy_topic, (char*)dummy_data, sizeof(dummy_data), 0, false);
+        
     }
 }
 
@@ -1090,24 +1088,25 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
       ESP_LOGI(TAG, "[MQTT] Connected");
       mqtt_connected = true;
 
-      esp_mqtt_client_subscribe(mqtt_client, "chat/room1", 1);
-      esp_mqtt_client_subscribe(mqtt_client, "chat/status", 1);
-      esp_mqtt_client_subscribe(mqtt_client, "chat/keyexchange", 1);
-      esp_mqtt_client_subscribe(mqtt_client, "chat/input", 1);  // NEW: Subscribe to input topic
+      // Clear any retained offline messages first
+      esp_mqtt_client_publish(mqtt_client, "chat/status", "", 0, 1, true);
+      vTaskDelay(100 / portTICK_PERIOD_MS); // Brief delay
 
-      // Publish online status
+      // Subscribe to only 3 rooms
+      esp_mqtt_client_subscribe(mqtt_client, "chat/talk", 1);     
+      esp_mqtt_client_subscribe(mqtt_client, "chat/enc", 1);      
+      esp_mqtt_client_subscribe(mqtt_client, "chat/status", 1);   
+      esp_mqtt_client_subscribe(mqtt_client, "chat/keyexchange", 1);
+
+      // Publish online status to chat/status
       esp_netif_ip_info_t ip_info;
       esp_netif_get_ip_info(sta_netif, &ip_info);
       char ip_str[16];
       esp_ip4addr_ntoa(&ip_info.ip, ip_str, sizeof(ip_str));
 
-      char onlineMsg[256];
-      snprintf(onlineMsg, sizeof(onlineMsg), "{\"device\":\"%s\",\"status\":\"online\",\"ip\":\"%s\"}", deviceID, ip_str);
-
-      char *encrypted = NULL;
-      encryptMessage(onlineMsg, &encrypted);
-      esp_mqtt_client_publish(mqtt_client, "chat/status", encrypted, 0, 1, true);
-      free(encrypted);
+      char statusMsg[256];
+      snprintf(statusMsg, sizeof(statusMsg), "[%s] Device online - IP: %s", deviceID, ip_str);
+      esp_mqtt_client_publish(mqtt_client, "chat/status", statusMsg, 0, 0, false);
 
       initiateKeyExchange();
       break;
@@ -1127,9 +1126,23 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         memcpy(topic, event->topic, event->topic_len);
         topic[event->topic_len] = '\0';
 
-        ESP_LOGI(TAG, "[MQTT Event] Message received on topic '%s': %s", topic, msg);
+        // Skip processing our own status messages to prevent loops
+        if (strcmp(topic, "chat/status") == 0) {
+          if (strstr(msg, deviceID)) {
+            ESP_LOGI(TAG, "[STATUS] %s", msg);
+            return; // Don't process our own status messages
+          }
+        }
+
+        // Log message received (only for non-status messages)
+        if (strcmp(topic, "chat/status") != 0) {
+          char statusLog[512];
+          snprintf(statusLog, sizeof(statusLog), "[%s] Message received on %s", deviceID, topic);
+          esp_mqtt_client_publish(mqtt_client, "chat/status", statusLog, 0, 0, false);
+        }
 
         if (strcmp(topic, "chat/keyexchange") == 0) {
+          // Handle key exchange
           const char* device_start = strstr(msg, "\"device\":\"");
           if (device_start) {
             device_start += 10;
@@ -1138,7 +1151,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             char peer_device[20] = {0};
             strncpy(peer_device, device_start, device_end - device_start);
             peer_device[device_end - device_start] = '\0';
-            if (strcmp(peer_device, deviceID) == 0) break;
+            if (strcmp(peer_device, deviceID) == 0) break; // Skip our own messages
           }
 
           const char* pub_start = strstr(msg, "\"pubkey\":\"");
@@ -1150,68 +1163,74 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             computeSharedSecret(peer_pubkey_b64);
             free(peer_pubkey_b64);
           }
-        } 
-        else if (strcmp(topic, "chat/input") == 0) {
-          // NEW: Handle plaintext input messages - encrypt and relay them
-          ESP_LOGI(TAG, "[MQTT] Received plaintext message for encryption: %s", msg);
           
-          // Create formatted message with device info
-          int rssi;
-          esp_wifi_sta_get_rssi(&rssi);
+          // Log key exchange status
+          char statusLog[256];
+          snprintf(statusLog, sizeof(statusLog), "[%s] Key exchange processed - Encryption: %s", 
+                   deviceID, crypto_ctx.keys_established ? "ENABLED" : "DISABLED");
+          esp_mqtt_client_publish(mqtt_client, "chat/status", statusLog, 0, 0, false);
+        }
+        else if (strcmp(topic, "chat/talk") == 0) {
+          // chat/talk only shows decrypted/plain text messages
+          bool is_encrypted = strstr(msg, "\"encrypted\":true") != NULL;
           
-          char formatted_msg[512];
-          snprintf(formatted_msg, sizeof(formatted_msg), 
-                  "{\"device\":\"%s\",\"message\":\"%s\",\"rssi\":%d,\"timestamp\":%llu,\"type\":\"user_message\"}", 
-                  deviceID, msg, rssi, esp_timer_get_time() / 1000);
-          
-          // Encrypt and publish to chat/room1
-          char *encrypted = NULL;
-          encryptMessage(formatted_msg, &encrypted);
-          if (encrypted) {
-            ESP_LOGI(TAG, "[MQTT] Relaying encrypted message to chat/room1");
-            esp_mqtt_client_publish(mqtt_client, "chat/room1", encrypted, 0, 1, false);
+          if (is_encrypted) {
+            // If encrypted message comes to chat/talk, decrypt it and display
+            char *decrypted = NULL;
+            int decrypt_result = decryptMessage(msg, &decrypted);
             
-            // NEW: Also publish the original plaintext to input_processed for debugging
-            char debug_msg[1024];
-            snprintf(debug_msg, sizeof(debug_msg), 
-                    "[PROCESSED by %s] Original: %s | Formatted: %s", 
-                    deviceID, msg, formatted_msg);
-            esp_mqtt_client_publish(mqtt_client, "chat/input_processed", debug_msg, 0, 0, false);
-            ESP_LOGI(TAG, "[MQTT] Published processing info to chat/input_processed");
+            char statusLog[256];
+            snprintf(statusLog, sizeof(statusLog), "[%s] Decrypting message in chat/talk - Result: %s", 
+                     deviceID, (decrypt_result == 0) ? "SUCCESS" : "FAILED");
+            esp_mqtt_client_publish(mqtt_client, "chat/status", statusLog, 0, 0, false);
             
-            free(encrypted);
+            if (decrypted && decrypt_result == 0) {
+              ESP_LOGI(TAG, "[CHAT DECRYPTED] %s", decrypted);
+              free(decrypted);
+            }
+          } else {
+            // Plain text message - display it normally
+            ESP_LOGI(TAG, "[CHAT] %s", msg);
+            char statusLog[256];
+            snprintf(statusLog, sizeof(statusLog), "[%s] Plain text message in chat/talk", deviceID);
+            esp_mqtt_client_publish(mqtt_client, "chat/status", statusLog, 0, 0, false);
           }
         }
-        else {
-          // Handle encrypted messages from chat/room1, chat/status, etc.
-          char *decrypted = NULL;
-          decryptMessage(msg, &decrypted);
-          ESP_LOGI(TAG, "[MQTT Event] Decrypted message on %s: %s", topic, decrypted);
+        else if (strcmp(topic, "chat/enc") == 0) {
+          // chat/enc should show encrypted messages or encrypt plain text
+          bool is_encrypted = strstr(msg, "\"encrypted\":true") != NULL;
           
-          // NEW: Publish decrypted message to debug room for monitoring
-          if (strcmp(topic, "chat/room1") == 0) {
-            // Publish to decrypted room for debugging
-            char debug_msg[1024];
-            snprintf(debug_msg, sizeof(debug_msg), 
-                    "[DECRYPTED by %s] %s", deviceID, decrypted);
-            esp_mqtt_client_publish(mqtt_client, "chat/room1_decrypted", debug_msg, 0, 0, false);
-            ESP_LOGI(TAG, "[MQTT] Published decrypted message to chat/room1_decrypted");
+          if (is_encrypted) {
+            // Already encrypted - just display it
+            ESP_LOGI(TAG, "[ENC DISPLAY] %s", msg);
+            char statusLog[256];
+            snprintf(statusLog, sizeof(statusLog), "[%s] Encrypted message displayed in chat/enc", deviceID);
+            esp_mqtt_client_publish(mqtt_client, "chat/status", statusLog, 0, 0, false);
+          } else {
+            // Plain text in chat/enc - encrypt it and display encrypted form
+            char *encrypted = NULL;
+            int encrypt_result = encryptMessage(msg, &encrypted);
+            
+            char statusLog[256];
+            snprintf(statusLog, sizeof(statusLog), "[%s] Encrypting plain text in chat/enc - Result: %s", 
+                     deviceID, (encrypt_result == 0) ? "SUCCESS" : "FAILED");
+            esp_mqtt_client_publish(mqtt_client, "chat/status", statusLog, 0, 0, false);
+            
+            if (encrypted && encrypt_result == 0) {
+              esp_mqtt_client_publish(mqtt_client, "chat/enc", encrypted, 0, 1, false);
+              ESP_LOGI(TAG, "[ENC PUBLISHED] %s", encrypted);
+            } else {
+              ESP_LOGI(TAG, "[ENC DISPLAY] %s", msg); // Show original if encryption failed
+            }
           }
-          else if (strcmp(topic, "chat/status") == 0) {
-            // Publish status decryptions to separate debug room
-            char debug_msg[1024];
-            snprintf(debug_msg, sizeof(debug_msg), 
-                    "[STATUS DECRYPTED by %s] %s", deviceID, decrypted);
-            esp_mqtt_client_publish(mqtt_client, "chat/status_decrypted", debug_msg, 0, 0, false);
-            ESP_LOGI(TAG, "[MQTT] Published decrypted status to chat/status_decrypted");
-          }
-          
-          free(decrypted);
+        }
+        else if (strcmp(topic, "chat/status") == 0) {
+          // Just log status messages from other devices
+          ESP_LOGI(TAG, "[STATUS] %s", msg);
         }
       }
       break;
 
-    // Add these cases to handle the missing MQTT events (to fix warnings)
     case MQTT_EVENT_ERROR:
     case MQTT_EVENT_SUBSCRIBED:
     case MQTT_EVENT_UNSUBSCRIBED:
@@ -1223,7 +1242,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     default:
       break;
   }
-} // <-- This closing brace was missing!
+}
+
+// DH key exchange 
 static void initiateKeyExchange() {
   ESP_LOGI(TAG, "[MQTT] Initiating Diffie-Hellman key exchange");
 
@@ -1234,7 +1255,7 @@ static void initiateKeyExchange() {
   snprintf(key_exchange_msg, sizeof(key_exchange_msg), "{\"device\":\"%s\",\"pubkey\":\"%s\",\"timestamp\":%llu}", deviceID, public_key, esp_timer_get_time() / 1000);
   free(public_key);
 
-  esp_mqtt_client_publish(mqtt_client, "chat/keyexchange", key_exchange_msg, 0, 0, false);
+  //esp_mqtt_client_publish(mqtt_client, "chat/keyexchange", key_exchange_msg, 0, 0, false);
 }
 
 static void mqttPublishMessage(const char* message) {
@@ -1243,16 +1264,47 @@ static void mqttPublishMessage(const char* message) {
   int rssi;
   esp_wifi_sta_get_rssi(&rssi);
 
+  // Create message with device info and RSSI
   char plaintext_payload[512];
-  snprintf(plaintext_payload, sizeof(plaintext_payload), "{\"device\":\"%s\",\"message\":\"%s\",\"rssi\":%d,\"timestamp\":%llu}", deviceID, message, rssi, esp_timer_get_time() / 1000);
+  snprintf(plaintext_payload, sizeof(plaintext_payload), 
+           "{\"device\":\"%s\",\"message\":\"%s\",\"rssi\":%d,\"timestamp\":%llu}", 
+           deviceID, message, rssi, esp_timer_get_time() / 1000);
 
-  char *encrypted = NULL;
-  encryptMessage(plaintext_payload, &encrypted);
-  if (encrypted) {
-    esp_mqtt_client_publish(mqtt_client, "chat/room1", encrypted, 0, 1, false);
-    free(encrypted);
+  // Log that we're sending a message
+  char statusMsg[256];
+  snprintf(statusMsg, sizeof(statusMsg), "[%s] Sending message - Encryption: %s", 
+           deviceID, crypto_ctx.keys_established ? "ENABLED" : "DISABLED");
+  esp_mqtt_client_publish(mqtt_client, "chat/status", statusMsg, 0, 0, false);
+
+  if (crypto_ctx.keys_established) {
+    // Encrypt the message
+    char *encrypted = NULL;
+    int encrypt_result = encryptMessage(plaintext_payload, &encrypted);
+    
+    if (encrypted) {
+      // Publish encrypted message to main chat room
+      esp_mqtt_client_publish(mqtt_client, "chat/talk", encrypted, 0, 1, false);
+      
+      // Also publish to encrypted display room with additional info
+      char enc_display[1024];
+      snprintf(enc_display, sizeof(enc_display), "[%s | RSSI: %d] %s", deviceID, rssi, encrypted);
+      esp_mqtt_client_publish(mqtt_client, "chat/enc", enc_display, 0, 0, false);
+      
+      // Log encryption status
+      snprintf(statusMsg, sizeof(statusMsg), "[%s] Message sent - Encryption: SUCCESS", deviceID);
+      esp_mqtt_client_publish(mqtt_client, "chat/status", statusMsg, 0, 0, false);
+      
+      free(encrypted);
+    }
+  } else {
+    // No encryption - send directly to chat/talk as plaintext
+    esp_mqtt_client_publish(mqtt_client, "chat/talk", plaintext_payload, 0, 1, false);
+    
+    snprintf(statusMsg, sizeof(statusMsg), "[%s] Message sent - Encryption: DISABLED (sent as plaintext)", deviceID);
+    esp_mqtt_client_publish(mqtt_client, "chat/status", statusMsg, 0, 0, false);
   }
 }
+
 
 static void mqttPublishStatus(const char* status) {
   if (!mqtt_connected) return;
@@ -1260,24 +1312,57 @@ static void mqttPublishStatus(const char* status) {
   int rssi;
   esp_wifi_sta_get_rssi(&rssi);
 
-  char plaintext_payload[512];
-  snprintf(plaintext_payload, sizeof(plaintext_payload), "{\"device\":\"%s\",\"status\":\"%s\",\"rssi\":%d,\"uptime\":%llu,\"free_heap\":%d,\"encryption_active\":%d}",
-           deviceID, status, rssi, esp_timer_get_time() / 1000, (int)esp_get_free_heap_size(), crypto_ctx.keys_established ? 1 : 0);
-
-  char *encrypted = NULL;
-  encryptMessage(plaintext_payload, &encrypted);
-  if (encrypted) {
-    esp_mqtt_client_publish(mqtt_client, "chat/status", encrypted, 0, 1, true);
-    free(encrypted);
-  }
+  // Publish simple status to status room (no encryption for logs)
+  char statusMsg[512];
+  snprintf(statusMsg, sizeof(statusMsg), 
+           "[%s] Status: %s | RSSI: %d | Uptime: %llu | Free Heap: %d | Encryption: %s",
+           deviceID, status, rssi, esp_timer_get_time() / 1000, 
+           (int)esp_get_free_heap_size(), 
+           crypto_ctx.keys_established ? "ACTIVE" : "INACTIVE");
+  
+  esp_mqtt_client_publish(mqtt_client, "chat/status", statusMsg, 0, 0, false); // Changed retain to false
 }
 
+static void setupMQTTClient() {
+  char will_msg[128];
+  snprintf(will_msg, sizeof(will_msg), "[%s] Device offline", deviceID);
+
+  esp_mqtt_client_config_t mqtt_cfg = {
+    .broker.address.uri = "mqtt://" MQTT_BROKER,
+    .credentials.client_id = deviceID,
+    .session.last_will = {
+      .topic = "chat/status",  // Will message goes to status room
+      .msg = will_msg,
+      .msg_len = 0,
+      .qos = 1,
+      .retain = true
+    },
+    .network.reconnect_timeout_ms = 5000,
+    .buffer.size = 2048
+  };
+
+  mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+  esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+  esp_mqtt_client_start(mqtt_client);
+}
+
+
 static void chatTask(void* param) {
+  static bool hello_sent = false;
+  
   while (1) {
-    if (mqtt_connected) {
+    if (mqtt_connected && !hello_sent) {
       mqttPublishMessage("Hello from ESP32!");
+      hello_sent = true;
+      
+      // Log that we've sent the initial hello message
+      char statusMsg[128];
+      snprintf(statusMsg, sizeof(statusMsg), "[%s] Initial hello message sent", deviceID);
+      esp_mqtt_client_publish(mqtt_client, "chat/status", statusMsg, 0, 0, false);
     }
-    vTaskDelay(15000 / portTICK_PERIOD_MS);
+    
+    // Keep the task running but don't send more messages
+    vTaskDelay(30000 / portTICK_PERIOD_MS); // Check every 30 seconds
   }
 }
 
@@ -1286,7 +1371,7 @@ static void statusTask(void* param) {
     if (wifi_connected && mqtt_connected) {
       mqttPublishStatus("online");
     }
-    vTaskDelay(STATUS_INTERVAL / portTICK_PERIOD_MS);
+    vTaskDelay(120000 / portTICK_PERIOD_MS); // Changed from 30 seconds to 2 minutes
   }
 }
 
@@ -1335,6 +1420,8 @@ void app_main(void) {
 
   initCrypto();
 
+
+
   snprintf(deviceID, sizeof(deviceID), "ESP32-%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   generateRandomMAC(mac);
   snprintf(virtualDeviceID, sizeof(virtualDeviceID), "ESP32-%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -1361,7 +1448,7 @@ void app_main(void) {
   esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
 
   char will_msg[128];
-  snprintf(will_msg, sizeof(will_msg), "{\"device\":\"%s\",\"status\":\"offline\"}", deviceID);
+  snprintf(will_msg, sizeof(will_msg), "[%s] Device offline", deviceID);
 
   esp_mqtt_client_config_t mqtt_cfg = {
     .broker.address.uri = "mqtt://" MQTT_BROKER,
@@ -1369,9 +1456,9 @@ void app_main(void) {
     .session.last_will = {
       .topic = "chat/status",
       .msg = will_msg,
-      .msg_len = 0, // null-terminated
+      .msg_len = 0,
       .qos = 1,
-      .retain = true
+      .retain = false  // Changed from true to false to prevent retained offline messages
     },
     .network.reconnect_timeout_ms = 5000,
     .buffer.size = 2048
